@@ -23,7 +23,7 @@ Um sistema completo para monitorar preços de produtos no Mercado Livre, com ale
    pip install -r requirements.txt
    ```
 
-3. **Configure webhook Discord:**
+3. **Configure webhook Discord (opcional):**
    - No seu servidor Discord: `Configurações > Integrações > Webhooks`
    - Crie um webhook e copie a URL
    - Configure a variável de ambiente:
@@ -32,9 +32,61 @@ Um sistema completo para monitorar preços de produtos no Mercado Livre, com ale
      $env:DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/SEU_ID/SEU_TOKEN"
      ```
 
+## 🔒 Segurança e Configuração
+
+### Arquivos Sensíveis
+- **Nunca commite** `.env` (contém webhooks/tokens)
+- **Nunca commite** `data/` (banco de dados com dados reais)
+- **Nunca commite** `__pycache__/` (arquivos compilados)
+
+### Configuração Segura
+1. Copie `.env.example` para `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edite `.env` com suas configurações reais:
+   ```env
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/SEU_WEBHOOK_ID/SEU_WEBHOOK_TOKEN
+   ```
+
+3. O `.gitignore` já está configurado para ignorar arquivos sensíveis.
+
 ## 🗄️ Banco de Dados
 
-O projeto usa SQLite. Na primeira execução, o banco é criado automaticamente.
+O projeto usa SQLite. Na primeira execução, o banco é criado automaticamente em `data/produtos.db`.
+
+## 🚀 Publicação no GitHub
+
+### Preparação para Publicação
+1. **Limpe dados sensíveis:**
+   ```bash
+   python clean_for_github.py
+   ```
+   Este script remove:
+   - `data/` (banco com dados reais)
+   - `__pycache__/` (arquivos compilados)
+   - `.env` (credenciais)
+   - Outros arquivos temporários
+
+   **Nota:** Se `data/` não for removido automaticamente, delete manualmente antes de commitar.
+
+2. **Verifique arquivos:**
+   - ✅ `.gitignore` existe e está correto
+   - ✅ `.env.example` existe (template)
+   - ✅ README.md atualizado
+   - ❌ Nenhum webhook/token hardcoded
+
+3. **Teste antes de publicar:**
+   ```bash
+   pip install -r requirements.txt
+   python web.py
+   ```
+
+### Após Publicar
+- Peça para colaboradores copiarem `.env.example` para `.env`
+- Configurem suas próprias webhooks Discord
+- O banco será criado automaticamente na primeira execução
 
 ## ▶️ Como Usar
 

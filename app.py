@@ -1,9 +1,9 @@
-from database.db import init_db
+from database.db import ensure_db
 from database.models import listar_produtos, atualizar_preco
 from scrappers.mercado_livre import pegar_preco
 from services.discord_alert import enviar_alerta_discord
 
-init_db()
+ensure_db()
 
 produtos = listar_produtos()
 
