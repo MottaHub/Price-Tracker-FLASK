@@ -1,14 +1,13 @@
 """
 Scraper do Mercado Livre
-- Preço atual : lido direto da página do produto cadastrado
-- Menor preço : raspado das "outras opções de compra" da própria página
-               + buscado via API oficial (api.mercadolibre.com)
+- Preço atual : vendedor principal da página
+- Menor preço : menor valor encontrado nos blocos de vendedores da página
+                (seção "Outras opções de compra" / buybox)
 """
 
 import re
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
 
 HEADERS = {
     'User-Agent': (
@@ -17,106 +16,11 @@ HEADERS = {
         'Chrome/124.0.0.0 Safari/537.36'
     ),
     'Accept-Language': 'pt-BR,pt;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
 
-ML_API = 'https://api.mercadolibre.com'
 
-# ── Configuração do filtro de similaridade ─────────────────────────────────
-
-_STOPWORDS = {
-    'com', 'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'para',
-    'por', 'e', 'ou', 'a', 'o', 'um', 'uma', 'celular', 'smartphone',
-    'perfume', 'deo', 'parfum', 'eau', 'edp', 'edt', 'tela', 'camera',
-    'ml', 'gb', 'tb',
-}
-
-_DISCRIMINANTES_NEGATIVOS = {
-    'refil', 'kit', 'recondicionado', 'seminovo', 'usado', 'reembalado',
-    'mini', 'travel', 'amostra', 'combo',
-}
-
-_DISCRIMINANTES_GENERO = {'feminino', 'masculino', 'unissex', 'infantil'}
-
-_SUFIXOS_CRITICOS = {'gb', 'tb', 'mb'}
-
-_SCORE_MINIMO = 0.40
-
-
-# ── Normalização ───────────────────────────────────────────────────────────
-
-def _normalizar(texto):
-    texto = texto.lower()
-    for origem, dest in [
-        ('ã','a'), ('â','a'), ('á','a'), ('à','a'),
-        ('ê','e'), ('é','e'), ('è','e'),
-        ('í','i'), ('î','i'),
-        ('õ','o'), ('ô','o'), ('ó','o'),
-        ('ú','u'), ('û','u'), ('ç','c'),
-    ]:
-        texto = texto.replace(origem, dest)
-    texto = re.sub(r'[^a-z0-9\s]', ' ', texto)
-    return [w for w in texto.split() if w not in _STOPWORDS and len(w) > 1]
-
-
-def _parse_num(token):
-    m = re.match(r'^(\d+)([a-z]*)$', token)
-    if m:
-        return int(m.group(1)), m.group(2)
-    return None, None
-
-
-# ── Algoritmo de similaridade ──────────────────────────────────────────────
-
-def _score_similaridade(nome_original, titulo_resultado):
-    orig_lista  = _normalizar(nome_original)
-    resul_lista = _normalizar(titulo_resultado)
-    orig  = set(orig_lista)
-    resul = set(resul_lista)
-
-    for palavra in _DISCRIMINANTES_NEGATIVOS:
-        if palavra in resul and palavra not in orig:
-            return 0.0
-
-    genero_orig  = _DISCRIMINANTES_GENERO & orig
-    genero_resul = _DISCRIMINANTES_GENERO & resul
-    if genero_orig and genero_resul and genero_orig != genero_resul:
-        return 0.0
-
-    nums_orig  = {}
-    for w in orig_lista:
-        v, suf = _parse_num(w)
-        if v is not None and suf in _SUFIXOS_CRITICOS:
-            nums_orig.setdefault(suf, []).append(v)
-
-    nums_resul = {}
-    for w in resul_lista:
-        v, suf = _parse_num(w)
-        if v is not None and suf in _SUFIXOS_CRITICOS:
-            nums_resul.setdefault(suf, []).append(v)
-
-    for suf, vals_orig in nums_orig.items():
-        vals_resul = nums_resul.get(suf, [])
-        if not vals_resul:
-            continue
-        for vo in vals_orig:
-            for vr in vals_resul:
-                ratio = max(vo, vr) / max(min(vo, vr), 1)
-                if ratio < 10 and vo != vr:
-                    return 0.0
-
-    chaves = [w for w in orig_lista if len(w) >= 4 and not re.search(r'\d', w)]
-    if not chaves:
-        return 1.0
-
-    # Se o nome original aparece direto no título, aceita
-    if nome_original.lower() in titulo_resultado.lower():
-        return 1.0
-
-    hits = sum(1 for p in chaves if p in resul)
-    return hits / len(chaves)
-
-
-# ── Preço da página cadastrada ─────────────────────────────────────────────
+# ── HTTP ───────────────────────────────────────────────────────────────────
 
 def _get_soup(url):
     try:
@@ -129,13 +33,21 @@ def _get_soup(url):
     return None
 
 
-def _extrair_preco_do_bloco(bloco):
-    if bloco is None:
-        return None
-    fraction = bloco.select_one('.andes-money-amount__fraction, .price-tag-fraction')
-    cents    = bloco.select_one('.andes-money-amount__cents, .price-tag-cents')
+# ── Extração de valor monetário ────────────────────────────────────────────
+
+def _valor_do_elemento(el):
+    """
+    Dado um elemento BeautifulSoup que contém um bloco de preço do ML,
+    tenta extrair o float. Funciona com andes-money-amount ou price-tag.
+    """
+    fraction = el.select_one(
+        '.andes-money-amount__fraction, .price-tag-fraction'
+    )
     if not fraction:
         return None
+    cents = el.select_one(
+        '.andes-money-amount__cents, .price-tag-cents'
+    )
     texto = fraction.get_text(strip=True)
     if cents:
         texto += ',' + cents.get_text(strip=True).lstrip('.')
@@ -145,15 +57,28 @@ def _extrair_preco_do_bloco(bloco):
         return None
 
 
+# ── Preço principal ────────────────────────────────────────────────────────
+
 def _preco_principal(soup):
-    for seletor in ('.ui-pdp-price__second-line', '.ui-pdp-price__main-price', '.ui-pdp-price'):
+    """Preço do vendedor destacado (topo da página)."""
+    for seletor in (
+        '.ui-pdp-price__second-line',
+        '.ui-pdp-price__main-price',
+        '.ui-pdp-price',
+    ):
         bloco = soup.select_one(seletor)
-        preco = _extrair_preco_do_bloco(bloco)
-        if preco:
-            return preco
-    fraction = soup.find('span', class_=re.compile(r'(price-tag-fraction|andes-money-amount__fraction)'))
+        v = _valor_do_elemento(bloco) if bloco else None
+        if v:
+            return v
+
+    # fallback: primeiro fraction da página
+    fraction = soup.find(
+        'span', class_=re.compile(r'(price-tag-fraction|andes-money-amount__fraction)')
+    )
     if fraction:
-        cents = fraction.find_next_sibling('span', class_=re.compile(r'(price-tag-cents|andes-money-amount__cents)'))
+        cents = fraction.find_next_sibling(
+            'span', class_=re.compile(r'(price-tag-cents|andes-money-amount__cents)')
+        )
         texto = fraction.get_text(strip=True)
         if cents:
             texto += ',' + cents.get_text(strip=True).lstrip('.')
@@ -164,97 +89,99 @@ def _preco_principal(soup):
     return None
 
 
-# ── Outras opções de compra da página ─────────────────────────────────────
+# ── Menor preço entre outros vendedores ───────────────────────────────────
 
-def _extrair_menor_outras_opcoes(soup, preco_principal=None):
+def _menor_preco_outros_vendedores(soup, preco_principal):
     """
-    Raspa a seção 'Outras opções de compra' da página do produto
-    e retorna (menor_preco, url_do_vendedor) — apenas se for menor que o principal.
+    Busca especificamente os blocos de outros vendedores na página.
+    Usa seletores conhecidos do ML e filtra preços de parcelas.
+    Retorna (menor_preco, url) ou (None, None).
     """
-    menor_preco = None
-    menor_url   = None
 
-    # Coleta todos os valores de fraction na página
-    todos = []
-    for fraction in soup.find_all('span', class_=re.compile(r'andes-money-amount__fraction')):
-        cents = fraction.find_next_sibling('span', class_=re.compile(r'andes-money-amount__cents'))
-        texto = fraction.get_text(strip=True)
-        if cents:
-            texto += ',' + cents.get_text(strip=True).lstrip('.')
-        try:
-            valor = float(texto.replace('.', '').replace(',', '.'))
-            if valor > 10:  # ignora valores absurdos pequenos
-                todos.append(valor)
-        except ValueError:
-            pass
+    # Seletores dos containers de outros vendedores no ML
+    SELETORES_CONTAINER = [
+        '.ui-pdp-other-sellers__rows',          # lista de vendedores
+        '.ui-pdp-buybox__offers',               # ofertas no buybox
+        '[class*="other-sellers"]',             # qualquer classe com other-sellers
+        '[class*="seller-list"]',
+        '[class*="compra-agora"]',
+    ]
 
-    if not todos:
-        return None, None
-
-    menor = min(todos)
-    print(f'[Scraper] Menor preço na página: R${menor:.2f}')
-
-    # Só retorna se for realmente menor que o preço principal
-    if preco_principal is not None and menor >= preco_principal:
-        return None, None
-
-    return menor, None
-
-
-# ── Busca via API oficial do ML ────────────────────────────────────────────
-
-def _buscar_menor_via_api(nome_produto, preco_referencia=None, limite=20):
-    url = f'{ML_API}/sites/MLB/search?q={quote_plus(nome_produto)}&limit={limite}'
-
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            print(f'[API ML] HTTP {r.status_code}')
-            return None, None
-        dados = r.json()
-    except Exception as e:
-        print(f'[API ML] Erro: {e}')
-        return None, None
-
-    resultados = dados.get('results', [])
-    if not resultados:
-        print(f'[API ML] Sem resultados para "{nome_produto}"')
-        return None, None
+    # Seletores de cada item/row de vendedor
+    SELETORES_ROW = [
+        '.ui-pdp-other-sellers__row',
+        '.ui-pdp-buybox__offer',
+        '[class*="seller-row"]',
+        '[class*="offer-row"]',
+    ]
 
     menor_preco = None
     menor_url   = None
 
-    orig_norm = set(_normalizar(nome_produto))
+    def processar_bloco(bloco):
+        nonlocal menor_preco, menor_url
 
-    for item in resultados:
-        titulo  = item.get('title', '')
-        preco   = item.get('price')
-        link    = item.get('permalink')
-        cond    = item.get('condition', '')
+        preco = _valor_do_elemento(bloco)
+        if preco is None:
+            return
 
-        if not preco or not link:
-            continue
+        # Ignora valores menores que 20% do preço principal (provavelmente parcela)
+        if preco_principal and preco < preco_principal * 0.20:
+            print(f'[Scraper] Ignorando valor suspeito (parcela?): R${preco:.2f}')
+            return
 
-        if cond == 'used' and 'recondicionado' not in orig_norm and 'usado' not in orig_norm:
-            continue
+        # Tenta pegar link do vendedor dentro do bloco
+        link_tag = bloco.select_one('a[href]')
+        link = None
+        if link_tag:
+            href = link_tag.get('href', '')
+            if href.startswith('http'):
+                link = href
+            elif href.startswith('/'):
+                link = 'https://www.mercadolivre.com.br' + href
 
-        if preco_referencia and preco < preco_referencia * 0.15:
-            continue
-
-        score = _score_similaridade(nome_produto, titulo)
-        print(f'[API ML] score={score:.2f} R${preco:<8.2f} {titulo[:55]}')
-
-        if score < _SCORE_MINIMO:
-            continue
+        print(f'[Scraper] Vendedor encontrado: R${preco:.2f} -> {link}')
 
         if menor_preco is None or preco < menor_preco:
             menor_preco = preco
             menor_url   = link
 
-    if menor_preco:
-        print(f'[API ML] ✅ Menor aprovado: R${menor_preco:.2f}')
-    else:
-        print(f'[API ML] ❌ Nenhum resultado passou o filtro')
+    # Tenta pelos containers
+    encontrou = False
+    for seletor in SELETORES_CONTAINER:
+        container = soup.select_one(seletor)
+        if container:
+            encontrou = True
+            print(f'[Scraper] Container encontrado: {seletor}')
+            for row_sel in SELETORES_ROW:
+                rows = container.select(row_sel)
+                for row in rows:
+                    processar_bloco(row)
+            if menor_preco is None:
+                # Tenta direto no container
+                processar_bloco(container)
+
+    # Fallback: busca todos os blocos de preço que estejam dentro de links
+    if not encontrou or menor_preco is None:
+        print('[Scraper] Fallback: buscando preços dentro de links...')
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag.get('href', '')
+            # Só considera links de produtos ML
+            if 'mercadolivre.com.br' not in href and not href.startswith('/'):
+                continue
+            preco = _valor_do_elemento(a_tag)
+            if preco is None:
+                continue
+            if preco_principal and preco < preco_principal * 0.20:
+                continue
+            if preco >= (preco_principal or 0):
+                continue  # só interessa se for menor que o principal
+            if href.startswith('/'):
+                href = 'https://www.mercadolivre.com.br' + href
+            print(f'[Scraper] Link com preço menor: R${preco:.2f} -> {href[:60]}')
+            if menor_preco is None or preco < menor_preco:
+                menor_preco = preco
+                menor_url   = href
 
     return menor_preco, menor_url
 
@@ -270,41 +197,31 @@ def pegar_precos_completo(url, nome_produto=None):
     """
     Retorna dict com:
       - preco_atual    : preço do vendedor principal na URL cadastrada
-      - menor_preco    : menor preço encontrado (outras opções da página + API)
-      - menor_preco_url: link direto para o menor preço (ou None se veio da página)
+      - menor_preco    : menor preço encontrado entre outros vendedores
+      - menor_preco_url: link direto para o menor preço
     """
     soup = _get_soup(url)
     if soup is None:
         return {'preco_atual': None, 'menor_preco': None, 'menor_preco_url': None}
 
     preco_atual = _preco_principal(soup)
-    print(f'[Scraper] Preço na URL: R${preco_atual}')
+    print(f'[Scraper] Preço principal: R${preco_atual}')
 
-    # 1) Outras opções de compra na própria página
-    menor_pagina, menor_pagina_url = _extrair_menor_outras_opcoes(soup, preco_principal=preco_atual)
+    menor, menor_url = _menor_preco_outros_vendedores(soup, preco_atual)
 
-    # 2) Busca via API
-    menor_api, menor_api_url = None, None
-    if nome_produto:
-        menor_api, menor_api_url = _buscar_menor_via_api(
-            nome_produto,
-            preco_referencia=preco_atual,
-        )
+    # Só exibe menor preço se for de fato menor que o atual
+    if menor is not None and preco_atual is not None and menor >= preco_atual:
+        print(f'[Scraper] Nenhum vendedor com preço menor encontrado.')
+        menor     = None
+        menor_url = None
 
-    # Escolhe o menor entre todas as fontes
-    candidatos = []
-    if menor_pagina is not None:
-        candidatos.append((menor_pagina, menor_pagina_url))
-    if menor_api is not None:
-        candidatos.append((menor_api, menor_api_url))
-
-    if candidatos:
-        menor_final, menor_url_final = min(candidatos, key=lambda x: x[0])
+    if menor:
+        print(f'[Scraper] ✅ Menor preço final: R${menor:.2f}')
     else:
-        menor_final, menor_url_final = None, None
+        print(f'[Scraper] ℹ️ Sem menor preço disponível.')
 
     return {
         'preco_atual': preco_atual,
-        'menor_preco': menor_final,
-        'menor_preco_url': menor_url_final,
+        'menor_preco': menor,
+        'menor_preco_url': menor_url,
     }
