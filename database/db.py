@@ -10,11 +10,10 @@ def get_connection():
 
 
 def init_db(force=False):
-    # cria pasta se não existir
     os.makedirs("data", exist_ok=True)
 
-    # verifica se banco já existe (para evitar recriar em imports)
     if os.path.exists(DB_PATH) and not force:
+        _migrar()
         return
 
     conn = get_connection()
@@ -27,29 +26,39 @@ def init_db(force=False):
         url TEXT NOT NULL,
         url_base TEXT,
         menor_preco REAL,
+        menor_preco_url TEXT,
         ultimo_preco REAL
     )
     """)
 
-    # migrar campo url_base se necessário
+    conn.commit()
+    conn.close()
+    _migrar()
+
+
+def _migrar():
+    conn = get_connection()
+    cursor = conn.cursor()
+
     cursor.execute("PRAGMA table_info(produtos)")
     columns = [row[1] for row in cursor.fetchall()]
+
     if 'url_base' not in columns:
         cursor.execute('ALTER TABLE produtos ADD COLUMN url_base TEXT')
+    if 'menor_preco_url' not in columns:
+        cursor.execute('ALTER TABLE produtos ADD COLUMN menor_preco_url TEXT')
 
     conn.commit()
 
-    # normalizar urls já existentes
-    cursor.execute('SELECT id, url FROM produtos')
-    for produto_id, url in cursor.fetchall():
+    cursor.execute('SELECT id, url FROM produtos WHERE url_base IS NULL')
+    for row in cursor.fetchall():
         from database.models import normalizar_url
-        base = normalizar_url(url)
-        cursor.execute('UPDATE produtos SET url_base = ? WHERE id = ?', (base, produto_id))
+        base = normalizar_url(row['url'])
+        cursor.execute('UPDATE produtos SET url_base = ? WHERE id = ?', (base, row['id']))
 
     conn.commit()
     conn.close()
 
 
 def ensure_db():
-    """Garante que o banco existe (chamado explicitamente)"""
     init_db(force=False)
